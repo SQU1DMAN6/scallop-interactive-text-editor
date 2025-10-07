@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"go/format"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -104,6 +107,8 @@ type Editor struct {
 	lines            []string
 	cursorLine       int
 	cursorCol        int
+	cursorVisualCol  int // visual column accounting for tabs
+	horizOffset      int // horizontal scroll offset (in visual columns)
 	scrollOffset     int
 	mode             Mode
 	commandBuf       string
@@ -139,6 +144,7 @@ func NewEditor() *Editor {
 		},
 		lineTokens:       [][]Token{{}},
 		embeddedContexts: [][]EmbeddedContext{{}},
+		horizOffset:      0,
 	}
 	editor.highlighter = NewSyntaxHighlighter(PlainText)
 	return editor
@@ -218,9 +224,11 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 			e.cursorCol = prevWordStart(ln, e.cursorCol)
 		} else if e.cursorCol > 0 {
 			e.cursorCol--
+			e.updateCursorVisualCol()
 		} else if e.cursorLine > 0 {
 			e.cursorLine--
 			e.cursorCol = len(e.lines[e.cursorLine])
+			e.updateCursorVisualCol()
 			e.adjustScroll()
 		}
 	case tcell.KeyRight:
@@ -228,9 +236,11 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 			e.cursorCol = nextWordEnd(ln, e.cursorCol)
 		} else if e.cursorCol < len(ln) {
 			e.cursorCol++
+			e.updateCursorVisualCol()
 		} else if e.cursorLine < len(e.lines)-1 {
 			e.cursorLine++
 			e.cursorCol = 0
+			e.updateCursorVisualCol()
 			e.adjustScroll()
 		}
 	case tcell.KeyUp:
@@ -273,6 +283,34 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 			newLine = ln[e.cursorCol:]
 			e.lines[e.cursorLine] = ln[:e.cursorCol]
 		}
+
+		// If the character before cursor is an opening bracket and the next char is the matching closing bracket
+		if e.cursorCol > 0 && e.cursorCol < len(ln) {
+			prev := rune(ln[e.cursorCol-1])
+			next := rune(ln[e.cursorCol])
+			if (prev == '{' && next == '}') || (prev == '[' && next == ']') || (prev == '(' && next == ')') {
+				// insert newline, put closing bracket on its own line and indent
+				indent := detectIndentation(e.lines[e.cursorLine])
+				innerIndent := indent + "\t"
+				// current line becomes up to cursor-1 (including opening bracket)
+				left := e.lines[e.cursorLine][:e.cursorCol]
+				// ensure left ends with opening bracket
+				e.lines[e.cursorLine] = left
+				// insert the inner line and the closing bracket line
+				// newLine already begins with the closing bracket, so don't prepend it again
+				insert := []string{innerIndent, indent + newLine}
+				e.lines = append(e.lines[:e.cursorLine+1], append(insert, e.lines[e.cursorLine+1:]...)...)
+				e.lineTokens = append(e.lineTokens[:e.cursorLine+1], append([][]Token{{}, {}}, e.lineTokens[e.cursorLine+1:]...)...)
+				e.embeddedContexts = append(e.embeddedContexts[:e.cursorLine+1], append([][]EmbeddedContext{{}, {}}, e.embeddedContexts[e.cursorLine+1:]...)...)
+				e.cursorLine++
+				e.cursorCol = len(innerIndent)
+				e.dirty = true
+				e.updateSyntaxHighlighting()
+				e.adjustScroll()
+				return
+			}
+		}
+
 		e.lines = append(e.lines[:e.cursorLine+1], append([]string{newLine}, e.lines[e.cursorLine+1:]...)...)
 		e.lineTokens = append(e.lineTokens[:e.cursorLine+1], append([][]Token{{}}, e.lineTokens[e.cursorLine+1:]...)...)
 		e.embeddedContexts = append(e.embeddedContexts[:e.cursorLine+1], append([][]EmbeddedContext{{}}, e.embeddedContexts[e.cursorLine+1:]...)...)
@@ -283,10 +321,29 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 		e.adjustScroll()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if e.cursorCol > 0 {
+			// If deleting an opening bracket and next is matching closing bracket and the area is empty, remove both
+			if e.cursorCol > 0 && e.cursorCol < len(ln) {
+				prev := rune(ln[e.cursorCol-1])
+				next := rune(ln[e.cursorCol])
+				if (prev == '{' && next == '}') || (prev == '[' && next == ']') || (prev == '(' && next == ')') {
+					// If nothing between (cursor was between brackets)
+					if e.cursorCol-1 == e.cursorCol-1 {
+						// remove closing bracket too
+						e.lines[e.cursorLine] = ln[:e.cursorCol-1] + ln[e.cursorCol+1:]
+						e.cursorCol--
+						e.dirty = true
+						e.updateLineTokens(e.cursorLine)
+						e.updateCursorVisualCol()
+						return
+					}
+				}
+			}
+
 			e.lines[e.cursorLine] = ln[:e.cursorCol-1] + ln[e.cursorCol:]
 			e.cursorCol--
 			e.dirty = true
 			e.updateLineTokens(e.cursorLine)
+			e.updateCursorVisualCol()
 		} else if e.cursorLine > 0 {
 			prev := e.lines[e.cursorLine-1]
 			e.lines[e.cursorLine-1] = prev + ln
@@ -316,7 +373,28 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 		r := key.Rune()
 		e.handleRuneInput(r)
 		e.dirty = true
+	case tcell.KeyTab:
+		// Insert a tab character
+		ln := e.lines[e.cursorLine]
+		e.lines[e.cursorLine] = ln[:e.cursorCol] + "\t" + ln[e.cursorCol:]
+		e.cursorCol++
+		e.updateLineTokens(e.cursorLine)
+		e.updateCursorVisualCol()
+		e.dirty = true
 	}
+}
+
+// detectIndentation returns the leading whitespace (tabs/spaces) of a line
+func detectIndentation(line string) string {
+	i := 0
+	for i < len(line) {
+		if line[i] == ' ' || line[i] == '\t' {
+			i++
+		} else {
+			break
+		}
+	}
+	return line[:i]
 }
 
 func (e *Editor) fixCursorCol() {
@@ -394,6 +472,69 @@ func (e *Editor) handlePromptQuit(key *tcell.EventKey) {
 		}
 	}
 }
+
+// ----------------- FORMATTING & TESTS -----------------
+
+// formatBuffer formats buffer for supported languages (Go and JSON)
+func (e *Editor) formatBuffer() {
+	switch e.format {
+	case Go:
+		src := strings.Join(e.lines, "\n")
+		out, err := formatSourceGo(src)
+		if err == nil {
+			e.lines = strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
+			e.dirty = false
+			e.updateSyntaxHighlighting()
+		} else {
+			// keep buffer; optionally show error in status later
+		}
+	case JSON:
+		src := strings.Join(e.lines, "\n")
+		out, err := formatJSON(src)
+		if err == nil {
+			e.lines = strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
+			e.dirty = false
+			e.updateSyntaxHighlighting()
+		}
+	default:
+		//
+	}
+}
+
+// runGoTests runs `go test ./...` and returns raw output (stdout+stderr)
+func (e *Editor) runGoTests() (string, error) {
+	// Use os/exec to run go test
+	cmd := exec.Command("go", "test", "./...")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// parseGoTestOutput extracts file:line:msg style diagnostics
+func parseGoTestOutput(output string) []Diagnostic {
+	var diags []Diagnostic
+	// simple regex for file:line:col: message OR file:line: message
+	re := regexp.MustCompile(`([\w\./_-]+\.go):(\d+)(?::(\d+))?:\s*(.*)`)
+	matches := re.FindAllStringSubmatch(output, -1)
+	for _, m := range matches {
+		lineNum := 0
+		if n, err := strconv.Atoi(m[2]); err == nil {
+			lineNum = n - 1
+		}
+		diags = append(diags, Diagnostic{File: m[1], Line: lineNum, Message: m[4]})
+	}
+	return diags
+}
+
+type Diagnostic struct {
+	File    string
+	Line    int
+	Message string
+}
+
+var diagnostics []Diagnostic
+
+// ----------------- UTIL: run external command -----------------
+// (runGoTests uses os/exec directly)
 
 // ----------------- FIND MODE -----------------
 
@@ -494,7 +635,44 @@ func (e *Editor) executeCommand() {
 			}
 			e.adjustScroll()
 		}
+	case "format":
+		e.formatBuffer()
+	case "test":
+		out, _ := e.runGoTests()
+		diagnostics = parseGoTestOutput(out)
+		// if diagnostics pertain to current file, position cursor to first
+		if len(diagnostics) > 0 && e.filename != "" {
+			for _, d := range diagnostics {
+				if filepath.Base(d.File) == filepath.Base(e.filename) {
+					if d.Line >= 0 && d.Line < len(e.lines) {
+						e.cursorLine = d.Line
+						e.adjustScroll()
+						break
+					}
+				}
+			}
+		}
 	}
+}
+
+func formatSourceGo(src string) (string, error) {
+	out, err := format.Source([]byte(src))
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func formatJSON(src string) (string, error) {
+	var v interface{}
+	if err := json.Unmarshal([]byte(src), &v); err != nil {
+		return "", err
+	}
+	out, err := json.MarshalIndent(v, "", "    ")
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func (e *Editor) promptSaveCommandLine() {
@@ -549,7 +727,7 @@ func (e *Editor) Render() {
 
 	// Top bar
 	drawLine(e.screen, 0, 0, w, '-')
-	header := "SITE 0.1, written by SQU1DMAN"
+	header := "SITE v1, written by SQU1DMAN"
 	if e.filename != "" {
 		header += " | " + e.filename
 		if e.dirty {
@@ -577,7 +755,8 @@ func (e *Editor) Render() {
 			currentLineNumStr = lineNumStr
 		}
 		drawString(e.screen, 0, 3+i, lineNumStr)
-		e.drawHighlightedLine(len(lineNumStr), 3+i, idx)
+		// draw with horizontal clipping using expanded tabs
+		e.drawHighlightedLineWithHScroll(len(lineNumStr), 3+i, idx, w-lineNumWidth-2)
 	}
 
 	// Scroll bar
@@ -591,9 +770,33 @@ func (e *Editor) Render() {
 		drawString(e.screen, w-1, topY+pos, "█")
 	}
 
-	// Command line separators
-	drawLine(e.screen, 0, h-2, w, '-')
-	drawLine(e.screen, 0, h-0, w, '-')
+	// Diagnostic/status area and command line separator placement
+	statusMsg := ""
+	if len(diagnostics) > 0 {
+		for _, d := range diagnostics {
+			if filepath.Base(d.File) == filepath.Base(e.filename) {
+				if d.Line == e.cursorLine {
+					statusMsg = "Error: " + d.Message
+					break
+				}
+			}
+		}
+		if statusMsg == "" {
+			for _, d := range diagnostics {
+				if filepath.Base(d.File) == filepath.Base(e.filename) {
+					statusMsg = "Warning: " + d.Message
+					break
+				}
+			}
+		}
+	}
+
+	statusY := h - 3
+	cmdY := h - 1
+	if statusMsg != "" {
+		drawString(e.screen, 0, statusY+1, statusMsg)
+	}
+	drawLine(e.screen, 0, cmdY-1, w, '-')
 
 	// Command line
 	switch e.mode {
@@ -602,14 +805,14 @@ func (e *Editor) Render() {
 		if e.savePending {
 			prompt += "File name: "
 		}
-		drawString(e.screen, 0, h-1, prompt+e.commandBuf)
+		drawString(e.screen, 0, cmdY, prompt+e.commandBuf)
 	case PromptQuit:
-		drawString(e.screen, 0, h-1, "=> Save file? [Y/n] ")
+		drawString(e.screen, 0, cmdY, "=> Save file? [Y/n] ")
 	case Find:
-		drawString(e.screen, 0, h-1, "> "+e.findBuf)
+		drawString(e.screen, 0, cmdY, "> "+e.findBuf)
 	}
 
-	// Calculate cursor position using actual line number string length
+	// Calculate cursor position using actual line number string length and visual columns
 	if currentLineNumStr == "" {
 		// Fallback if current line is not visible
 		prefix := " "
@@ -618,8 +821,166 @@ func (e *Editor) Render() {
 		}
 		currentLineNumStr = fmt.Sprintf("%*d%s ", lineNumWidth-2, e.cursorLine+1, prefix)
 	}
-	e.screen.ShowCursor(e.cursorCol+len(currentLineNumStr), e.cursorLine-e.scrollOffset+3)
+	// Ensure cursor visual column is updated
+	e.updateCursorVisualCol()
+	// Ensure horizontal scroll keeps cursor visible
+	if e.cursorVisualCol < e.horizOffset {
+		e.horizOffset = e.cursorVisualCol
+	}
+	maxVisible := w - len(currentLineNumStr) - 2
+	if e.cursorVisualCol >= e.horizOffset+maxVisible {
+		e.horizOffset = e.cursorVisualCol - maxVisible + 1
+	}
+	// Place cursor taking horizOffset into account
+	screenX := e.cursorVisualCol - e.horizOffset + len(currentLineNumStr)
+	e.screen.ShowCursor(screenX, e.cursorLine-e.scrollOffset+3)
 	e.screen.Show()
+}
+
+// expandTabs returns the visual representation of s with tabs expanded to 4 spaces
+func expandTabs(s string) string {
+	var out strings.Builder
+	col := 0
+	tabWidth := 4
+	for _, r := range s {
+		if r == '\t' {
+			spaces := tabWidth - (col % tabWidth)
+			out.WriteString(strings.Repeat(" ", spaces))
+			col += spaces
+		} else {
+			out.WriteRune(r)
+			col++
+		}
+	}
+	return out.String()
+}
+
+// visualColForByteCol computes visual column (expanding tabs) for a byte index within the line
+func visualColForByteCol(line string, byteCol int) int {
+	col := 0
+	for i := 0; i < byteCol && i < len(line); i++ {
+		if line[i] == '\t' {
+			spaces := 4 - (col % 4)
+			col += spaces
+		} else {
+			col++
+		}
+	}
+	return col
+}
+
+// byteColForVisualCol returns approximate byte index for a target visual column
+func byteColForVisualCol(line string, target int) int {
+	col := 0
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\t' {
+			spaces := 4 - (col % 4)
+			if col+spaces > target {
+				return i
+			}
+			col += spaces
+		} else {
+			if col+1 > target {
+				return i
+			}
+			col++
+		}
+	}
+	return len(line)
+}
+
+func (e *Editor) updateCursorVisualCol() {
+	if e.cursorLine < 0 || e.cursorLine >= len(e.lines) {
+		e.cursorVisualCol = 0
+		return
+	}
+	e.cursorVisualCol = visualColForByteCol(e.lines[e.cursorLine], e.cursorCol)
+}
+
+// drawHighlightedLineWithHScroll draws tokens but with horizontal clipping
+func (e *Editor) drawHighlightedLineWithHScroll(x, y, lineIdx, maxWidth int) {
+	if lineIdx >= len(e.lines) {
+		return
+	}
+	line := e.lines[lineIdx]
+	var tokens []Token
+	if lineIdx < len(e.lineTokens) {
+		tokens = e.lineTokens[lineIdx]
+	}
+
+	expanded := expandTabs(line)
+	totalVis := len(expanded)
+	visStart := e.horizOffset
+	if visStart < 0 {
+		visStart = 0
+	}
+	visEnd := visStart + maxWidth
+	if visEnd > totalVis {
+		visEnd = totalVis
+	}
+
+	// Precompute visual column for each byte index
+	n := len(line)
+	visMap := make([]int, n+1)
+	for i := 0; i <= n; i++ {
+		visMap[i] = visualColForByteCol(line, i)
+	}
+
+	// Walk tokens and draw gaps and tokens once
+	prevByte := 0
+	for _, token := range tokens {
+		if token.Start > prevByte {
+			gapVisStart := visMap[prevByte]
+			gapVisEnd := visMap[token.Start]
+			if gapVisEnd > visStart && gapVisStart < visEnd {
+				drawFrom := max(gapVisStart, visStart)
+				drawTo := min(gapVisEnd, visEnd)
+				if drawFrom < drawTo {
+					seg := expanded[drawFrom:drawTo]
+					drawString(e.screen, x+(drawFrom-visStart), y, seg)
+				}
+			}
+		}
+
+		// token
+		tVisStart := visMap[token.Start]
+		tVisEnd := visMap[token.End]
+		if tVisEnd > visStart && tVisStart < visEnd {
+			drawFrom := max(tVisStart, visStart)
+			drawTo := min(tVisEnd, visEnd)
+			if drawFrom < drawTo {
+				seg := expanded[drawFrom:drawTo]
+				style := e.getTokenStyle(token.Type)
+				startX := x + (drawFrom - visStart)
+				for i, r := range seg {
+					e.screen.SetContent(startX+i, y, r, nil, style)
+				}
+			}
+		}
+
+		prevByte = token.End
+	}
+
+	// trailing gap after last token
+	if prevByte < len(line) {
+		gapVisStart := visMap[prevByte]
+		gapVisEnd := visualColForByteCol(line, len(line))
+		if gapVisEnd > visStart && gapVisStart < visEnd {
+			drawFrom := max(gapVisStart, visStart)
+			drawTo := min(gapVisEnd, visEnd)
+			if drawFrom < drawTo {
+				seg := expanded[drawFrom:drawTo]
+				drawString(e.screen, x+(drawFrom-visStart), y, seg)
+			}
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ----------------- HELPERS -----------------
@@ -1359,19 +1720,19 @@ func (e *Editor) getTokenStyle(tokenType TokenType) tcell.Style {
 	case TokenString, TokenValue, TokenRegex:
 		return tcell.StyleDefault.Foreground(tcell.ColorLightGreen) // green for literals
 	case TokenComment, TokenDoctype, TokenPreprocessor:
-		return tcell.StyleDefault.Foreground(tcell.ColorGray).Background(tcell.ColorBlack).Italic(true) // muted gray for comments
+		return tcell.StyleDefault.Foreground(tcell.NewRGBColor(0, 101, 0)).Italic(true)
 	case TokenNumber, TokenConstant, TokenUnit, TokenEscape:
-		return tcell.StyleDefault.Foreground(tcell.ColorLightYellow) // yellow for numbers/consts
+		return tcell.StyleDefault.Foreground(tcell.ColorOrange) // yellow for numbers/consts
 	case TokenOperator, TokenImportant, TokenMacro, TokenTag:
 		return tcell.StyleDefault.Foreground(tcell.ColorRed) // red for operators/tags
 	case TokenFunction, TokenMethod:
-		return tcell.StyleDefault.Foreground(tcell.ColorLightCyan.TrueColor()) // cyan for functions
+		return tcell.StyleDefault.Foreground(tcell.NewRGBColor(54, 54, 235).TrueColor())
 	case TokenType_, TokenClass, TokenAttribute:
 		return tcell.StyleDefault.Foreground(tcell.ColorLightBlue) // blue for types/classes
 	case TokenVariable, TokenDelimiter:
-		return tcell.StyleDefault.Foreground(tcell.ColorWhite) // white for vars & punctuation
+		return tcell.StyleDefault.Foreground(tcell.NewRGBColor(44, 44, 178).TrueColor())
 	case TokenProperty, TokenPseudo, TokenAnnotation, TokenNamespace:
-		return tcell.StyleDefault.Foreground(tcell.ColorOrchid) // purple for meta/specials
+		return tcell.StyleDefault.Foreground(tcell.ColorOrchid)
 	default:
 		return tcell.StyleDefault
 	}
