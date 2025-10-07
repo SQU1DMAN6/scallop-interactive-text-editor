@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"go/format"
@@ -110,6 +111,10 @@ type Editor struct {
 	cursorVisualCol  int // visual column accounting for tabs
 	horizOffset      int // horizontal scroll offset (in visual columns)
 	scrollOffset     int
+	fileHandle       *os.File
+	fileOffsetLines  int  // how many lines have been loaded from file
+	partialLoad      bool // true when file is being streamed (not fully loaded)
+	clipboard        string
 	mode             Mode
 	commandBuf       string
 	findBuf          string
@@ -161,20 +166,25 @@ func (e *Editor) Run() {
 	e.screen = s
 	defer e.screen.Fini()
 
-	// Load file from os.Args
+	// Load file from os.Args (streamed to avoid OOM)
 	if len(os.Args) > 1 {
 		filename := os.Args[1]
-		data, err := ioutil.ReadFile(filename)
+		e.filename = filename
+		e.detectFormat()
+		f, err := os.Open(filename)
 		if err == nil {
-			e.lines = strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+			e.fileHandle = f
+			e.partialLoad = true
+			// read initial chunk
+			e.lines = readLinesFromReader(bufio.NewReader(f), 2000)
+			e.fileOffsetLines = len(e.lines)
 			if len(e.lines) == 0 {
 				e.lines = []string{""}
 			}
-			e.filename = filename
 			e.dirty = false
-			e.detectFormat()
 			e.updateSyntaxHighlighting()
 		} else {
+			// fallback to previous behavior (empty buffer and mark dirty)
 			e.filename = filename
 			e.dirty = true
 			e.detectFormat()
@@ -1710,6 +1720,49 @@ func (e *Editor) drawHighlightedLine(x, y, lineIdx int) {
 	// Draw remaining text
 	if pos < len(line) {
 		drawString(e.screen, x+pos, y, line[pos:])
+	}
+}
+
+// readLinesFromReader reads up to maxLines from reader and returns the lines slice.
+// It stops early on EOF and returns whatever it read.
+func readLinesFromReader(r *bufio.Reader, maxLines int) []string {
+	var lines []string
+	for i := 0; i < maxLines; i++ {
+		ln, err := r.ReadString('\n')
+		if err != nil {
+			if len(ln) > 0 {
+				// strip trailing newline if present
+				ln = strings.TrimRight(ln, "\n")
+				lines = append(lines, ln)
+			}
+			break
+		}
+		// remove trailing newline
+		lines = append(lines, strings.TrimRight(ln, "\n"))
+	}
+	return lines
+}
+
+// loadMoreLines appends up to n more lines from the open fileHandle into e.lines.
+// If EOF is reached it closes the file and marks partialLoad=false.
+func (e *Editor) loadMoreLines(n int) {
+	if e.fileHandle == nil || !e.partialLoad {
+		return
+	}
+	r := bufio.NewReader(e.fileHandle)
+	newLines := readLinesFromReader(r, n)
+	if len(newLines) > 0 {
+		e.lines = append(e.lines, newLines...)
+		e.fileOffsetLines = len(e.lines)
+		e.updateSyntaxHighlighting()
+	}
+	// Try to peek to see if EOF
+	_, err := r.Peek(1)
+	if err != nil {
+		// assume EOF or unreadable -> close and mark fully loaded
+		e.fileHandle.Close()
+		e.fileHandle = nil
+		e.partialLoad = false
 	}
 }
 
