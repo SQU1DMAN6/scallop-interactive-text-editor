@@ -2,7 +2,10 @@ module site
 
 go 1.24.7
 
-require github.com/gdamore/tcell/v2 v2.9.0
+require (
+	github.com/gdamore/tcell/v2 v2.9.0
+	golang.org/x/text v0.30.0
+)
 
 require (
 	github.com/gdamore/encoding v1.0.1 // indirect
@@ -11,5 +14,4 @@ require (
 	github.com/rivo/uniseg v0.4.3 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/term v0.34.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
 )

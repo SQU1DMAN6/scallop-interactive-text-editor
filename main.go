@@ -14,6 +14,9 @@ import (
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/unicode"
 )
 
 type Mode int
@@ -43,6 +46,7 @@ const (
 	Rust
 	Java
 	PHP
+	SquidPlusPlus
 )
 
 type TokenType int
@@ -126,6 +130,7 @@ type Editor struct {
 	savePending      bool
 	quitPending      bool
 	format           FileFormat
+	encoding         string // file encoding (utf-8, ascii, unicode, etc.)
 	highlighter      *SyntaxHighlighter
 	autoClosePairs   []AutoClosePair
 	lineTokens       [][]Token
@@ -136,9 +141,10 @@ var fileFormat string
 
 func NewEditor() *Editor {
 	editor := &Editor{
-		lines:  []string{""},
-		mode:   Interactive,
-		format: PlainText,
+		lines:    []string{""},
+		mode:     Interactive,
+		format:   PlainText,
+		encoding: "utf-8", // default encoding
 		autoClosePairs: []AutoClosePair{
 			{'(', ')'},
 			{'[', ']'},
@@ -171,17 +177,26 @@ func (e *Editor) Run() {
 		filename := os.Args[1]
 		e.filename = filename
 		e.detectFormat()
-		f, err := os.Open(filename)
+		// Read the entire file
+		content, err := ioutil.ReadFile(filename)
 		if err == nil {
-			e.fileHandle = f
-			e.partialLoad = true
-			// read initial chunk
-			e.lines = readLinesFromReader(bufio.NewReader(f), 2000)
-			e.fileOffsetLines = len(e.lines)
-			if len(e.lines) == 0 {
+			// Convert content to lines
+			if len(content) == 0 {
 				e.lines = []string{""}
+			} else {
+				e.lines = strings.Split(string(content), "\n")
+				// Remove last empty line if file doesn't end with newline
+				if len(e.lines) > 0 && e.lines[len(e.lines)-1] == "" {
+					e.lines = e.lines[:len(e.lines)-1]
+				}
+				if len(e.lines) == 0 {
+					e.lines = []string{""}
+				}
 			}
 			e.dirty = false
+			e.partialLoad = false
+			e.fileHandle = nil
+			e.fileOffsetLines = len(e.lines)
 			e.updateSyntaxHighlighting()
 		} else {
 			// fallback to previous behavior (empty buffer and mark dirty)
@@ -321,11 +336,31 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 			}
 		}
 
-		e.lines = append(e.lines[:e.cursorLine+1], append([]string{newLine}, e.lines[e.cursorLine+1:]...)...)
+		// Apply smart indentation for the new line
+		smartIndent := e.getSmartIndentation(e.cursorLine)
+		newLineWithIndent := smartIndent + newLine
+
+		e.lines = append(e.lines[:e.cursorLine+1], append([]string{newLineWithIndent}, e.lines[e.cursorLine+1:]...)...)
 		e.lineTokens = append(e.lineTokens[:e.cursorLine+1], append([][]Token{{}}, e.lineTokens[e.cursorLine+1:]...)...)
 		e.embeddedContexts = append(e.embeddedContexts[:e.cursorLine+1], append([][]EmbeddedContext{{}}, e.embeddedContexts[e.cursorLine+1:]...)...)
 		e.cursorLine++
-		e.cursorCol = 0
+
+		// Check if the new line content needs dedenting (starts with closing bracket)
+		newLineContent := strings.TrimSpace(newLine)
+		if len(newLineContent) > 0 {
+			firstChar := newLineContent[0]
+			if firstChar == '}' || firstChar == ']' || firstChar == ')' {
+				// Dedent the line
+				dedentedIndent := e.getDedentedIndentation(smartIndent)
+				e.lines[e.cursorLine] = dedentedIndent + newLine
+				e.cursorCol = len(dedentedIndent)
+			} else {
+				e.cursorCol = len(smartIndent)
+			}
+		} else {
+			e.cursorCol = len(smartIndent)
+		}
+
 		e.dirty = true
 		e.updateSyntaxHighlighting()
 		e.adjustScroll()
@@ -336,16 +371,13 @@ func (e *Editor) handleInteractive(key *tcell.EventKey) {
 				prev := rune(ln[e.cursorCol-1])
 				next := rune(ln[e.cursorCol])
 				if (prev == '{' && next == '}') || (prev == '[' && next == ']') || (prev == '(' && next == ')') {
-					// If nothing between (cursor was between brackets)
-					if e.cursorCol-1 == e.cursorCol-1 {
-						// remove closing bracket too
-						e.lines[e.cursorLine] = ln[:e.cursorCol-1] + ln[e.cursorCol+1:]
-						e.cursorCol--
-						e.dirty = true
-						e.updateLineTokens(e.cursorLine)
-						e.updateCursorVisualCol()
-						return
-					}
+					// Remove both brackets when they're adjacent
+					e.lines[e.cursorLine] = ln[:e.cursorCol-1] + ln[e.cursorCol+1:]
+					e.cursorCol--
+					e.dirty = true
+					e.updateLineTokens(e.cursorLine)
+					e.updateCursorVisualCol()
+					return
 				}
 			}
 
@@ -405,6 +437,129 @@ func detectIndentation(line string) string {
 		}
 	}
 	return line[:i]
+}
+
+// getSmartIndentation determines the appropriate indentation for a new line
+// based on the previous line and block context
+func (e *Editor) getSmartIndentation(lineIdx int) string {
+	if lineIdx <= 0 {
+		return ""
+	}
+
+	prevLine := e.lines[lineIdx-1]
+	baseIndent := detectIndentation(prevLine)
+
+	// Check if previous line ends with characters that should increase indentation
+	trimmed := strings.TrimSpace(prevLine)
+	if len(trimmed) > 0 {
+		lastChar := trimmed[len(trimmed)-1]
+
+		// Standard block opening characters
+		if lastChar == '{' || lastChar == '[' || lastChar == '(' {
+			return baseIndent + "\t"
+		}
+
+		// Language-specific indentation rules
+		if lastChar == ':' {
+			// Python, YAML, CSS rules
+			if e.format == Python || e.format == CSS {
+				return baseIndent + "\t"
+			}
+		}
+
+		// HTML/XML tag opening
+		if lastChar == '>' && strings.Contains(trimmed, "<") {
+			// Check if it's not a self-closing tag or comment
+			if !strings.HasSuffix(trimmed, "/>") && !strings.HasSuffix(trimmed, "-->") &&
+				!strings.Contains(trimmed, "<!") {
+				// Look for opening tag without corresponding closing tag on same line
+				openTags := strings.Count(trimmed, "<") - strings.Count(trimmed, "</")
+				if openTags > 0 {
+					return baseIndent + "\t"
+				}
+			}
+		}
+	}
+
+	// Check for language-specific keywords that should increase indentation
+	trimmedLower := strings.ToLower(trimmed)
+	switch e.format {
+	case Go, C, CPP, Java, JavaScript, PHP, Rust:
+		if e.endsWithBlockKeyword(trimmedLower) {
+			return baseIndent + "\t"
+		}
+	case Python:
+		if e.endsWithPythonBlockKeyword(trimmedLower) {
+			return baseIndent + "\t"
+		}
+	case SquidPlusPlus:
+		if e.endsWithSquidPlusPlusBlockKeyword(trimmedLower) {
+			return baseIndent + "\t"
+		}
+	}
+
+	return baseIndent
+}
+
+// endsWithBlockKeyword checks if a line ends with keywords that start blocks
+func (e *Editor) endsWithBlockKeyword(line string) bool {
+	blockKeywords := []string{
+		"if", "else", "elif", "while", "for", "switch", "case", "default",
+		"try", "catch", "finally", "function", "class", "struct", "interface",
+		"do", "foreach", "match", "impl", "trait", "mod", "fn", "el",
+	}
+
+	for _, keyword := range blockKeywords {
+		if strings.HasSuffix(line, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// endsWithSquidPlusPlusBlockKeyword checks for SQU1D++-specific block keywords
+func (e *Editor) endsWithSquidPlusPlusBlockKeyword(line string) bool {
+	squidKeywords := []string{
+		"if", "el", "while", "for", "def", "{",
+	}
+
+	for _, keyword := range squidKeywords {
+		if strings.HasSuffix(line, keyword) || strings.HasSuffix(line, keyword+" {") {
+			return true
+		}
+	}
+	return false
+}
+
+// endsWithPythonBlockKeyword checks for Python-specific block keywords
+func (e *Editor) endsWithPythonBlockKeyword(line string) bool {
+	pythonKeywords := []string{
+		"if", "elif", "else", "while", "for", "def", "class", "try", "except",
+		"finally", "with", "async def", "async with", "match", "case",
+	}
+
+	for _, keyword := range pythonKeywords {
+		if strings.HasSuffix(line, keyword+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// getDedentedIndentation reduces indentation by one level
+func (e *Editor) getDedentedIndentation(indent string) string {
+	if len(indent) == 0 {
+		return ""
+	}
+
+	// Remove one tab or 4 spaces
+	if indent[len(indent)-1] == '\t' {
+		return indent[:len(indent)-1]
+	} else if len(indent) >= 4 && indent[len(indent)-4:] == "    " {
+		return indent[:len(indent)-4]
+	}
+
+	return indent
 }
 
 func (e *Editor) fixCursorCol() {
@@ -543,9 +698,6 @@ type Diagnostic struct {
 
 var diagnostics []Diagnostic
 
-// ----------------- UTIL: run external command -----------------
-// (runGoTests uses os/exec directly)
-
 // ----------------- FIND MODE -----------------
 
 func (e *Editor) handleFind(key *tcell.EventKey) {
@@ -615,20 +767,17 @@ func (e *Editor) executeCommand() {
 		}
 	case "save":
 		if len(args) > 1 {
-			ioutil.WriteFile(args[1], []byte(strings.Join(e.lines, "\n")), 0644)
+			e.saveWithEncoding(args[1], strings.Join(e.lines, "\n"))
 			e.filename = args[1]
 			e.dirty = false
 			e.detectFormat()
 			e.updateSyntaxHighlighting()
 		} else if e.filename != "" {
-			ioutil.WriteFile(e.filename, []byte(strings.Join(e.lines, "\n")), 0644)
+			e.saveWithEncoding(e.filename, strings.Join(e.lines, "\n"))
 			e.dirty = false
 		} else {
 			e.promptSaveCommandLine()
 		}
-	case "find":
-		e.mode = Find
-		e.findBuf = ""
 	case "goto":
 		if len(args) >= 2 {
 			line, err := strconv.Atoi(args[1])
@@ -644,6 +793,10 @@ func (e *Editor) executeCommand() {
 				e.cursorCol = 0
 			}
 			e.adjustScroll()
+		}
+	case "setenc", "encode":
+		if len(args) >= 2 {
+			e.setEncoding(strings.ToLower(args[1]))
 		}
 	case "format":
 		e.formatBuffer()
@@ -731,20 +884,22 @@ func (e *Editor) pageSize() int {
 // }
 
 func (e *Editor) Render() {
+	// Set screen background
 	e.screen.Clear()
+	e.screen.Fill(' ', tcell.StyleDefault.Background(tcell.NewRGBColor(15, 20, 30)))
 	w, h := e.screen.Size()
 	height := h - 5
 
 	// Top bar
 	drawLine(e.screen, 0, 0, w, '-')
-	header := "SITE v1, written by SQU1DMAN"
+	header := "SITE v1.1, written by SQU1DMAN"
 	if e.filename != "" {
 		header += " | " + e.filename
 		if e.dirty {
 			header += " (Modified)"
 		}
 	}
-	header += " | Format: " + string(fileFormat)
+	header += " | Format: " + string(fileFormat) + " (" + e.encoding + ")"
 	drawString(e.screen, 0, 1, header)
 	drawLine(e.screen, 0, 2, w, '-')
 
@@ -780,8 +935,14 @@ func (e *Editor) Render() {
 		drawString(e.screen, w-1, topY+pos, "█")
 	}
 
+	// Auto-load more lines if we're near the end of currently loaded content
+	if e.partialLoad && e.cursorLine > len(e.lines)-100 {
+		e.loadMoreLines(1000)
+	}
+
 	// Diagnostic/status area and command line separator placement
 	statusMsg := ""
+	errorStyle := tcell.StyleDefault.Background(tcell.NewRGBColor(15, 20, 30)).Foreground(tcell.NewRGBColor(255, 0, 0))
 	if len(diagnostics) > 0 {
 		for _, d := range diagnostics {
 			if filepath.Base(d.File) == filepath.Base(e.filename) {
@@ -804,7 +965,10 @@ func (e *Editor) Render() {
 	statusY := h - 3
 	cmdY := h - 1
 	if statusMsg != "" {
-		drawString(e.screen, 0, statusY+1, statusMsg)
+		// Draw error/warning messages in red
+		for i, r := range statusMsg {
+			e.screen.SetContent(i, statusY+1, r, nil, errorStyle)
+		}
 	}
 	drawLine(e.screen, 0, cmdY-1, w, '-')
 
@@ -819,7 +983,7 @@ func (e *Editor) Render() {
 	case PromptQuit:
 		drawString(e.screen, 0, cmdY, "=> Save file? [Y/n] ")
 	case Find:
-		drawString(e.screen, 0, cmdY, "> "+e.findBuf)
+		drawString(e.screen, 0, cmdY, "Find > "+e.findBuf)
 	}
 
 	// Calculate cursor position using actual line number string length and visual columns
@@ -995,15 +1159,17 @@ func min(a, b int) int {
 
 // ----------------- HELPERS -----------------
 
-func drawLine(s tcell.Screen, x, y, width int, ch rune) {
+func drawLine(screen tcell.Screen, x, y, width int, ch rune) {
+	style := tcell.StyleDefault.Background(tcell.NewRGBColor(15, 20, 30))
 	for i := 0; i < width; i++ {
-		s.SetContent(x+i, y, ch, nil, tcell.StyleDefault)
+		screen.SetContent(x+i, y, ch, nil, style)
 	}
 }
 
-func drawString(s tcell.Screen, x, y int, str string) {
+func drawString(screen tcell.Screen, x, y int, str string) {
+	style := tcell.StyleDefault.Background(tcell.NewRGBColor(15, 20, 30)).Foreground(tcell.ColorWhite)
 	for i, r := range str {
-		s.SetContent(x+i, y, r, nil, tcell.StyleDefault)
+		screen.SetContent(x+i, y, r, nil, style)
 	}
 }
 
@@ -1125,6 +1291,9 @@ func (e *Editor) detectFormat() {
 	case ".php":
 		e.format = PHP
 		fileFormat = "PHP"
+	case ".sqd":
+		e.format = SquidPlusPlus
+		fileFormat = "SQU1D++"
 	default:
 		e.format = PlainText
 		fileFormat = "Plain Text"
@@ -1164,6 +1333,8 @@ func NewSyntaxHighlighter(format FileFormat) *SyntaxHighlighter {
 		h.setupCPPHighlighting()
 	case PHP:
 		h.setupPHPHighlighting()
+	case SquidPlusPlus:
+		h.setupSquidPlusPlusHighlighting()
 	case PlainText:
 		// PlainText doesn't need special highlighting, but we still need a valid case
 	default:
@@ -1178,21 +1349,58 @@ func NewSyntaxHighlighter(format FileFormat) *SyntaxHighlighter {
 func (h *SyntaxHighlighter) setupEmbeddedHighlighters() {
 	switch h.format {
 	case HTML:
-		// HTML can contain JavaScript, CSS, and PHP
-		h.embeddedHighlighters[JavaScript] = NewSyntaxHighlighter(JavaScript)
-		h.embeddedHighlighters[CSS] = NewSyntaxHighlighter(CSS)
-		h.embeddedHighlighters[PHP] = NewSyntaxHighlighter(PHP)
+		// HTML can contain JavaScript and CSS (but not PHP to avoid recursion)
+		h.embeddedHighlighters[JavaScript] = createBasicSyntaxHighlighter(JavaScript)
+		h.embeddedHighlighters[CSS] = createBasicSyntaxHighlighter(CSS)
 	case PHP:
-		// PHP can contain HTML, JavaScript, CSS
-		h.embeddedHighlighters[HTML] = NewSyntaxHighlighter(HTML)
-		h.embeddedHighlighters[JavaScript] = NewSyntaxHighlighter(JavaScript)
-		h.embeddedHighlighters[CSS] = NewSyntaxHighlighter(CSS)
+		// PHP can contain JavaScript and CSS (but not HTML to avoid recursion)
+		h.embeddedHighlighters[JavaScript] = createBasicSyntaxHighlighter(JavaScript)
+		h.embeddedHighlighters[CSS] = createBasicSyntaxHighlighter(CSS)
 	case Shell:
 		// Shell scripts can contain embedded code
-		h.embeddedHighlighters[HTML] = NewSyntaxHighlighter(HTML)
-		h.embeddedHighlighters[JavaScript] = NewSyntaxHighlighter(JavaScript)
-		h.embeddedHighlighters[Python] = NewSyntaxHighlighter(Python)
+		h.embeddedHighlighters[JavaScript] = createBasicSyntaxHighlighter(JavaScript)
+		h.embeddedHighlighters[Python] = createBasicSyntaxHighlighter(Python)
 	}
+}
+
+func createBasicSyntaxHighlighter(format FileFormat) *SyntaxHighlighter {
+	h := &SyntaxHighlighter{
+		format:               format,
+		keywords:             make(map[string]bool),
+		patterns:             make(map[TokenType]*regexp.Regexp),
+		embeddedHighlighters: make(map[FileFormat]*SyntaxHighlighter),
+	}
+
+	switch format {
+	case Go:
+		h.setupGoHighlighting()
+	case JavaScript:
+		h.setupJavaScriptHighlighting()
+	case Python:
+		h.setupPythonHighlighting()
+	case HTML:
+		h.setupHTMLHighlighting()
+	case CSS:
+		h.setupCSSHighlighting()
+	case Java:
+		h.setupJavaHighlighting()
+	case Rust:
+		h.setupRustHighlighting()
+	case C:
+		h.setupCHighlighting()
+	case CPP:
+		h.setupCPPHighlighting()
+	case PHP:
+		h.setupPHPHighlighting()
+	case PlainText:
+		// PlainText doesn't need special highlighting, but we still need a valid case
+	default:
+		h.format = PlainText
+	}
+
+	// Do not call setupEmbeddedHighlighters to avoid recursion
+
+	return h
 }
 
 func (h *SyntaxHighlighter) setupGoHighlighting() {
@@ -1214,11 +1422,13 @@ func (h *SyntaxHighlighter) setupGoHighlighting() {
 	h.patterns[TokenString] = regexp.MustCompile(`"([^"\\]|\\.)*"|` + "`[^`]*`" + `|'([^'\\]|\\.)*'`)
 	h.patterns[TokenComment] = regexp.MustCompile(`//.*$|/\*[\s\S]*?\*/`)
 	h.patterns[TokenNumber] = regexp.MustCompile(`\b\d+(\.\d+)?([eE][+-]?\d+)?\b|0[xX][0-9a-fA-F]+|0[0-7]+`)
-	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|:=|<<|>>|\+\+|--|&&|\|\||<-`)
-	h.patterns[TokenFunction] = regexp.MustCompile(`\b[a-zA-Z_][a-zA-Z0-9_]*\s*\(`)
+	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|:=|<<|>>|\+\+|--|&&|\|\||<-|\.\.\.|\.\.`)
+	h.patterns[TokenFunction] = regexp.MustCompile(`\b(func\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
+	h.patterns[TokenMethod] = regexp.MustCompile(`\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
 	h.patterns[TokenType_] = regexp.MustCompile(`\b[A-Z][a-zA-Z0-9_]*\b`)
 	h.patterns[TokenConstant] = regexp.MustCompile(`\b[A-Z][A-Z0-9_]*\b`)
 	h.patterns[TokenVariable] = regexp.MustCompile(`\b[a-z_][a-zA-Z0-9_]*\b`)
+	h.patterns[TokenPreprocessor] = regexp.MustCompile(`\bpackage\s+\w+|\bimport\s+`)
 }
 
 func (h *SyntaxHighlighter) setupJavaScriptHighlighting() {
@@ -1237,12 +1447,13 @@ func (h *SyntaxHighlighter) setupJavaScriptHighlighting() {
 	h.patterns[TokenString] = regexp.MustCompile(`"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|` + "`[^`]*`")
 	h.patterns[TokenComment] = regexp.MustCompile(`//.*$|/\*[\s\S]*?\*/`)
 	h.patterns[TokenNumber] = regexp.MustCompile(`\b\d+(\.\d+)?([eE][+-]?\d+)?\b|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+`)
-	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|===|!==|==|!=|<=|>=|\+\+|--|&&|\|\||=>`)
-	h.patterns[TokenFunction] = regexp.MustCompile(`\b[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(|function\s+[a-zA-Z_$][a-zA-Z0-9_$]*`)
-	h.patterns[TokenClass] = regexp.MustCompile(`\bclass\s+[a-zA-Z_$][a-zA-Z0-9_$]*|\bnew\s+[A-Z][a-zA-Z0-9_$]*`)
-	h.patterns[TokenMethod] = regexp.MustCompile(`\.[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(`)
-	h.patterns[TokenProperty] = regexp.MustCompile(`\.[a-zA-Z_$][a-zA-Z0-9_$]*`)
+	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|===|!==|==|!=|<=|>=|\+\+|--|&&|\|\||=>|\.\.\.`)
+	h.patterns[TokenFunction] = regexp.MustCompile(`\b(function\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(|([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>`)
+	h.patterns[TokenClass] = regexp.MustCompile(`\b(class\s+)([a-zA-Z_$][a-zA-Z0-9_$]*)|(\bnew\s+)([A-Z][a-zA-Z0-9_$]*)`)
+	h.patterns[TokenMethod] = regexp.MustCompile(`\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(`)
+	h.patterns[TokenProperty] = regexp.MustCompile(`\.([a-zA-Z_$][a-zA-Z0-9_$]*)`)
 	h.patterns[TokenRegex] = regexp.MustCompile(`/(?:[^/\\\n]|\\.)+/[gimuy]*`)
+	h.patterns[TokenVariable] = regexp.MustCompile(`\b(let|const|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)`)
 }
 
 func (h *SyntaxHighlighter) setupPythonHighlighting() {
@@ -1257,16 +1468,17 @@ func (h *SyntaxHighlighter) setupPythonHighlighting() {
 		h.keywords[keyword] = true
 	}
 
-	h.patterns[TokenString] = regexp.MustCompile(`"""[\s\S]*?"""|'''[\s\S]*?'''|"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|r"[^"]*"|r'[^']*'`)
+	h.patterns[TokenString] = regexp.MustCompile(`"""[\s\S]*?"""|'''[\s\S]*?'''|"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|r"[^"]*"|r'[^']*'|f"[^"]*"|f'[^']*'`)
 	h.patterns[TokenComment] = regexp.MustCompile(`#.*$`)
 	h.patterns[TokenNumber] = regexp.MustCompile(`\b\d+(\.\d+)?([eE][+-]?\d+)?\b|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+`)
-	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|==|!=|<=|>=|\*\*|//|@`)
-	h.patterns[TokenFunction] = regexp.MustCompile(`\bdef\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*\s*\(`)
-	h.patterns[TokenClass] = regexp.MustCompile(`\bclass\s+[a-zA-Z_][a-zA-Z0-9_]*`)
-	h.patterns[TokenMethod] = regexp.MustCompile(`\.[a-zA-Z_][a-zA-Z0-9_]*\s*\(`)
-	h.patterns[TokenProperty] = regexp.MustCompile(`\.[a-zA-Z_][a-zA-Z0-9_]*`)
-	h.patterns[TokenAnnotation] = regexp.MustCompile(`@[a-zA-Z_][a-zA-Z0-9_]*`)
+	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|==|!=|<=|>=|\*\*|//|@|\bin\b|\bis\b|\bnot\b`)
+	h.patterns[TokenFunction] = regexp.MustCompile(`\b(def\s+)([a-zA-Z_][a-zA-Z0-9_]*)|([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
+	h.patterns[TokenClass] = regexp.MustCompile(`\b(class\s+)([a-zA-Z_][a-zA-Z0-9_]*)`)
+	h.patterns[TokenMethod] = regexp.MustCompile(`\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
+	h.patterns[TokenProperty] = regexp.MustCompile(`\.([a-zA-Z_][a-zA-Z0-9_]*)`)
+	h.patterns[TokenAnnotation] = regexp.MustCompile(`@([a-zA-Z_][a-zA-Z0-9_]*)`)
 	h.patterns[TokenConstant] = regexp.MustCompile(`\b[A-Z][A-Z0-9_]*\b`)
+	h.patterns[TokenVariable] = regexp.MustCompile(`\bself\b|\bcls\b`)
 }
 
 func (h *SyntaxHighlighter) setupHTMLHighlighting() {
@@ -1438,16 +1650,40 @@ func (h *SyntaxHighlighter) setupPHPHighlighting() {
 		h.keywords[keyword] = true
 	}
 
-	h.patterns[TokenString] = regexp.MustCompile(`"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|<<<[A-Z_][A-Z0-9_]*[\s\S]*?^[A-Z_][A-Z0-9_]*`)
-	h.patterns[TokenComment] = regexp.MustCompile(`//.*$|/\*[\s\S]*?\*/|#.*$`)
-	h.patterns[TokenNumber] = regexp.MustCompile(`\b\d+(\.\d+)?([eE][+-]?\d+)?\b|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+`)
-	h.patterns[TokenOperator] = regexp.MustCompile(`[+\-*/=<>!&|^%]+|===|!==|==|!=|<=|>=|\*\*|//|\.|\?:|\?\?`)
+	// Safe PHP patterns that won't cause hanging
+	h.patterns[TokenString] = regexp.MustCompile(`"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'`)
+	h.patterns[TokenComment] = regexp.MustCompile(`//[^\r\n]*|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/|#[^\r\n]*`)
+	h.patterns[TokenNumber] = regexp.MustCompile(`\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+`)
+	h.patterns[TokenOperator] = regexp.MustCompile(`===|!==|==|!=|<=|>=|\*\*|\?\?|[+\-*/=<>!&|^%?:]`)
 	h.patterns[TokenVariable] = regexp.MustCompile(`\$[a-zA-Z_][a-zA-Z0-9_]*`)
-	h.patterns[TokenFunction] = regexp.MustCompile(`\bfunction\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*\s*\(`)
-	h.patterns[TokenClass] = regexp.MustCompile(`\bclass\s+[a-zA-Z_][a-zA-Z0-9_]*|[A-Z][a-zA-Z0-9_]*`)
-	h.patterns[TokenMethod] = regexp.MustCompile(`->[a-zA-Z_][a-zA-Z0-9_]*\s*\(|::[a-zA-Z_][a-zA-Z0-9_]*\s*\(`)
-	h.patterns[TokenProperty] = regexp.MustCompile(`->[a-zA-Z_][a-zA-Z0-9_]*|::[a-zA-Z_][a-zA-Z0-9_]*`)
-	h.patterns[TokenConstant] = regexp.MustCompile(`\b[A-Z][A-Z0-9_]*\b|__[A-Z_]+__`)
+	h.patterns[TokenFunction] = regexp.MustCompile(`\bfunction\s+[a-zA-Z_][a-zA-Z0-9_]*`)
+	h.patterns[TokenClass] = regexp.MustCompile(`\bclass\s+[a-zA-Z_][a-zA-Z0-9_]*`)
+	h.patterns[TokenMethod] = regexp.MustCompile(`->[a-zA-Z_][a-zA-Z0-9_]*`)
+	h.patterns[TokenProperty] = regexp.MustCompile(`->[a-zA-Z_][a-zA-Z0-9_]*`)
+	h.patterns[TokenConstant] = regexp.MustCompile(`\b[A-Z][A-Z0-9_]*\b`)
+}
+
+func (h *SyntaxHighlighter) setupSquidPlusPlusHighlighting() {
+	keywords := []string{
+		"var", "suppress", "def", "if", "el", "elif", "while", "for", "return", "true", "false", "null",
+		"break", "continue", "include", "pkg_create", "pkg_list", "pkg_remove", "i2fl", "fl2i",
+		"write", "read", "cat", "append", "tp", "abs", "sqrt", "pow", "sin", "cos", "upper",
+		"lower", "trim", "env", "exec", "sleep", "now",
+	}
+
+	for _, keyword := range keywords {
+		h.keywords[keyword] = true
+	}
+
+	// SQU1D++ patterns for syntax highlighting
+	h.patterns[TokenString] = regexp.MustCompile(`"[^"\\]*(?:\\.[^"\\]*)*"`)
+	h.patterns[TokenComment] = regexp.MustCompile(`#[^#\r\n]*#?`)
+	h.patterns[TokenNumber] = regexp.MustCompile(`\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|'[0-9]+(?:\.[0-9]+)?`)
+	h.patterns[TokenOperator] = regexp.MustCompile(`==|!=|<=|>=|[+\-*/=<>!%]`)
+	h.patterns[TokenFunction] = regexp.MustCompile(`\bdef\s*\(|\b(?:write|read|cat|append|tp|abs|sqrt|pow|sin|cos|upper|lower|trim|env|exec|sleep|now|pkg_create|pkg_list|pkg_remove|i2fl|fl2i)\b`)
+	h.patterns[TokenConstant] = regexp.MustCompile(`\b(?:true|false|null|pi|e)\b`)
+	h.patterns[TokenDelimiter] = regexp.MustCompile(`[{}\[\]();,]`)
+	h.patterns[TokenVariable] = regexp.MustCompile(`\b[a-zA-Z_][a-zA-Z0-9_]*\b`)
 }
 
 func (e *Editor) updateSyntaxHighlighting() {
@@ -1547,49 +1783,18 @@ func (h *SyntaxHighlighter) detectEmbeddedContexts(line string) []EmbeddedContex
 			}
 		}
 
-		// Detect PHP tags
-		phpPattern := regexp.MustCompile(`<\?php(.*?)\?>|<\?(.*?)\?>`)
-		matches = phpPattern.FindAllStringSubmatchIndex(line, -1)
-		for _, match := range matches {
-			if len(match) >= 4 {
-				start := match[2]
-				end := match[3]
-				if start == -1 && len(match) >= 6 {
-					start = match[4]
-					end = match[5]
-				}
-				if start != -1 {
-					contexts = append(contexts, EmbeddedContext{
-						Format: PHP,
-						Start:  start,
-						End:    end,
-					})
-				}
-			}
-		}
-
 	case PHP:
-		// Detect HTML outside PHP tags
-		htmlPattern := regexp.MustCompile(`\?>([^<]*(?:<[^<]*)*)<\?php`)
-		matches := htmlPattern.FindAllStringSubmatchIndex(line, -1)
-		for _, match := range matches {
-			if len(match) >= 4 {
-				contexts = append(contexts, EmbeddedContext{
-					Format: HTML,
-					Start:  match[2],
-					End:    match[3],
-				})
-			}
-		}
+		// PHP embedded contexts are handled differently to avoid recursion
+		// We don't detect HTML contexts within PHP files to prevent infinite recursion
 
 	case Shell:
-		// Detect heredoc with HTML
-		heredocPattern := regexp.MustCompile(`<<['"]*HTML['"]*\s*(.*?)\s*HTML`)
-		matches := heredocPattern.FindAllStringSubmatchIndex(line, -1)
+		// Detect JavaScript in shell scripts (no HTML to avoid recursion)
+		jsPattern := regexp.MustCompile(`node\s+-e\s+['"]([^'"]+)['"]`)
+		matches := jsPattern.FindAllStringSubmatchIndex(line, -1)
 		for _, match := range matches {
 			if len(match) >= 4 {
 				contexts = append(contexts, EmbeddedContext{
-					Format: HTML,
+					Format: JavaScript,
 					Start:  match[2],
 					End:    match[3],
 				})
@@ -1607,9 +1812,9 @@ func (h *SyntaxHighlighter) tokenizeLine(line string) []Token {
 
 	var tokens []Token
 
-	// First, find strings and comments (they have priority)
+	// Phase 1: Find strings and comments (highest priority)
 	for tokenType, pattern := range h.patterns {
-		if tokenType == TokenString || tokenType == TokenComment {
+		if tokenType == TokenString || tokenType == TokenComment || tokenType == TokenDoctype {
 			matches := pattern.FindAllStringIndex(line, -1)
 			for _, match := range matches {
 				tokens = append(tokens, Token{
@@ -1631,7 +1836,7 @@ func (h *SyntaxHighlighter) tokenizeLine(line string) []Token {
 		}
 	}
 
-	// Find keywords and other tokens, but skip areas already covered by strings/comments
+	// Phase 2: Find keywords (but skip areas already covered)
 	words := regexp.MustCompile(`\b\w+\b`).FindAllStringIndex(line, -1)
 	for _, wordMatch := range words {
 		if h.isPositionCovered(wordMatch[0], wordMatch[1], tokens) {
@@ -1649,16 +1854,21 @@ func (h *SyntaxHighlighter) tokenizeLine(line string) []Token {
 		}
 	}
 
-	// Find numbers and operators
+	// Phase 3: Find special patterns (functions, methods, etc.)
 	for tokenType, pattern := range h.patterns {
-		if tokenType != TokenString && tokenType != TokenComment {
-			matches := pattern.FindAllStringIndex(line, -1)
+		if tokenType != TokenString && tokenType != TokenComment && tokenType != TokenDoctype {
+			matches := pattern.FindAllStringSubmatchIndex(line, -1)
 			for _, match := range matches {
-				if !h.isPositionCovered(match[0], match[1], tokens) {
+				start, end := match[0], match[1]
+				if !h.isPositionCovered(start, end, tokens) {
+					// For function patterns with groups, use the group if available
+					if len(match) > 2 && match[2] != -1 {
+						start, end = match[2], match[3]
+					}
 					tokens = append(tokens, Token{
 						Type:    tokenType,
-						Start:   match[0],
-						End:     match[1],
+						Start:   start,
+						End:     end,
 						Context: h.format,
 					})
 				}
@@ -1666,7 +1876,10 @@ func (h *SyntaxHighlighter) tokenizeLine(line string) []Token {
 		}
 	}
 
-	// Sort tokens by start position again
+	// Phase 4: Context-specific tokenization for better accuracy
+	h.addContextSpecificTokens(line, &tokens)
+
+	// Final sort by start position
 	for i := 0; i < len(tokens); i++ {
 		for j := i + 1; j < len(tokens); j++ {
 			if tokens[i].Start > tokens[j].Start {
@@ -1676,6 +1889,185 @@ func (h *SyntaxHighlighter) tokenizeLine(line string) []Token {
 	}
 
 	return tokens
+}
+
+// addContextSpecificTokens adds language-specific tokenization improvements
+func (h *SyntaxHighlighter) addContextSpecificTokens(line string, tokens *[]Token) {
+	switch h.format {
+	case Go:
+		// Identify Go-specific patterns like struct fields, interface methods
+		structFieldPattern := regexp.MustCompile(`\b([A-Z]\w*)\s+\w+`)
+		matches := structFieldPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenType_,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+		// Function receivers and return types
+		receiverPattern := regexp.MustCompile(`func\s+\(.*?\)\s+(\w+)`)
+		matches = receiverPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenFunction,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+	case JavaScript:
+		// Identify arrow functions and method calls
+		arrowFuncPattern := regexp.MustCompile(`(\w+)\s*=>`)
+		matches := arrowFuncPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenVariable,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+		// Object property access
+		propertyPattern := regexp.MustCompile(`\.(\w+)`)
+		matches = propertyPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenProperty,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+	case Python:
+		// Identify self parameter and decorators
+		selfPattern := regexp.MustCompile(`\bself\b`)
+		matches := selfPattern.FindAllStringIndex(line, -1)
+		for _, match := range matches {
+			if !h.isPositionCovered(match[0], match[1], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenKeyword,
+					Start:   match[0],
+					End:     match[1],
+					Context: h.format,
+				})
+			}
+		}
+
+		// Decorators
+		decoratorPattern := regexp.MustCompile(`@(\w+)`)
+		matches = decoratorPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenAnnotation,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+	case SquidPlusPlus:
+		// Variable assignments
+		varAssignPattern := regexp.MustCompile(`var\s+(\w+)\s*=`)
+		matches := varAssignPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenVariable,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+		// Function names in def statements
+		defPattern := regexp.MustCompile(`var\s+(\w+)\s*=\s*def`)
+		matches = defPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenFunction,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+		// Array/object property access
+		accessPattern := regexp.MustCompile(`(\w+)\["([^"]+)"\]`)
+		matches = accessPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 5 && !h.isPositionCovered(match[4], match[5], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenProperty,
+					Start:   match[4],
+					End:     match[5],
+					Context: h.format,
+				})
+			}
+		}
+
+		// Quoted float literals
+		quotedFloatPattern := regexp.MustCompile(`'[0-9]*\.?[0-9]+`)
+		matches = quotedFloatPattern.FindAllStringIndex(line, -1)
+		for _, match := range matches {
+			if !h.isPositionCovered(match[0], match[1], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenNumber,
+					Start:   match[0],
+					End:     match[1],
+					Context: h.format,
+				})
+			}
+		}
+
+	case HTML:
+		// Tag attributes
+		attrPattern := regexp.MustCompile(`(\w+)=`)
+		matches := attrPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenAttribute,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+
+	case CSS:
+		// CSS selectors and properties
+		selectorPattern := regexp.MustCompile(`^([.#]?\w+[\w-]*)\s*{?`)
+		matches := selectorPattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) > 3 && !h.isPositionCovered(match[2], match[3], *tokens) {
+				*tokens = append(*tokens, Token{
+					Type:    TokenSelector,
+					Start:   match[2],
+					End:     match[3],
+					Context: h.format,
+				})
+			}
+		}
+	}
 }
 
 func (h *SyntaxHighlighter) isPositionCovered(start, end int, tokens []Token) bool {
@@ -1767,27 +2159,37 @@ func (e *Editor) loadMoreLines(n int) {
 }
 
 func (e *Editor) getTokenStyle(tokenType TokenType) tcell.Style {
+	// VS Code-like color scheme with dark teal background
+	baseStyle := tcell.StyleDefault.Background(tcell.NewRGBColor(15, 20, 30))
+
 	switch tokenType {
 	case TokenKeyword:
-		return tcell.StyleDefault.Foreground(tcell.ColorTurquoise).Bold(true)
+		// Keywords - rgb(0, 106, 255) - bright blue
+		return baseStyle.Foreground(tcell.NewRGBColor(0, 106, 255)).Bold(true)
 	case TokenString, TokenValue, TokenRegex:
-		return tcell.StyleDefault.Foreground(tcell.ColorLightGreen) // green for literals
+		// Strings - rgb(16, 128, 16) - green
+		return baseStyle.Foreground(tcell.NewRGBColor(16, 128, 16))
 	case TokenComment, TokenDoctype, TokenPreprocessor:
-		return tcell.StyleDefault.Foreground(tcell.NewRGBColor(0, 101, 0)).Italic(true)
-	case TokenNumber, TokenConstant, TokenUnit, TokenEscape:
-		return tcell.StyleDefault.Foreground(tcell.ColorOrange) // yellow for numbers/consts
-	case TokenOperator, TokenImportant, TokenMacro, TokenTag:
-		return tcell.StyleDefault.Foreground(tcell.ColorRed) // red for operators/tags
+		// Comments - rgb(128, 128, 128) - gray
+		return baseStyle.Foreground(tcell.NewRGBColor(128, 128, 128)).Italic(true)
 	case TokenFunction, TokenMethod:
-		return tcell.StyleDefault.Foreground(tcell.NewRGBColor(54, 54, 235).TrueColor())
-	case TokenType_, TokenClass, TokenAttribute:
-		return tcell.StyleDefault.Foreground(tcell.ColorLightBlue) // blue for types/classes
+		// Functions/Methods - rgb(255, 0, 255) - magenta
+		return baseStyle.Foreground(tcell.NewRGBColor(255, 0, 255))
 	case TokenVariable, TokenDelimiter:
-		return tcell.StyleDefault.Foreground(tcell.NewRGBColor(44, 44, 178).TrueColor())
-	case TokenProperty, TokenPseudo, TokenAnnotation, TokenNamespace:
-		return tcell.StyleDefault.Foreground(tcell.ColorOrchid)
+		// Variables/Parameters - rgb(128, 128, 16) - olive/yellow-green
+		return baseStyle.Foreground(tcell.NewRGBColor(128, 128, 16))
+	case TokenNumber, TokenConstant, TokenUnit, TokenEscape:
+		// Numbers/Constants/Operators - rgb(255, 165, 0) - orange
+		return baseStyle.Foreground(tcell.NewRGBColor(255, 165, 0))
+	case TokenOperator, TokenImportant, TokenMacro, TokenTag:
+		// Operators/Punctuation - rgb(255, 165, 0) - orange
+		return baseStyle.Foreground(tcell.NewRGBColor(255, 165, 0))
+	case TokenType_, TokenClass, TokenAttribute, TokenProperty, TokenPseudo, TokenAnnotation, TokenNamespace:
+		// Other misc syntax elements - rgb(0, 255, 255) - cyan
+		return baseStyle.Foreground(tcell.NewRGBColor(0, 255, 255))
 	default:
-		return tcell.StyleDefault
+		// Everything else - default style
+		return baseStyle
 	}
 }
 
@@ -1795,6 +2197,18 @@ func (e *Editor) getTokenStyle(tokenType TokenType) tcell.Style {
 
 func (e *Editor) handleRuneInput(r rune) {
 	ln := e.lines[e.cursorLine]
+
+	// Check if typing a closing bracket at start of line - auto-dedent
+	if (r == '}' || r == ']' || r == ')') && e.cursorCol == len(strings.TrimLeft(ln, " \t")) {
+		currentIndent := detectIndentation(ln)
+		if len(currentIndent) > 0 {
+			dedentedIndent := e.getDedentedIndentation(currentIndent)
+			// Replace current line with dedented version
+			trimmedContent := strings.TrimLeft(ln, " \t")
+			e.lines[e.cursorLine] = dedentedIndent + trimmedContent
+			e.cursorCol = len(dedentedIndent)
+		}
+	}
 
 	// Check for auto-closing pairs
 	for _, pair := range e.autoClosePairs {
@@ -1845,6 +2259,61 @@ func (e *Editor) insertAutoClosePair(open, close rune) {
 }
 
 // ----------------- MAIN -----------------
+
+// setEncoding sets the file encoding for reading/writing files
+func (e *Editor) setEncoding(enc string) {
+	switch enc {
+	case "utf-8", "utf8":
+		e.encoding = "utf-8"
+	case "ascii":
+		e.encoding = "ascii"
+	case "unicode", "utf-16", "utf16":
+		e.encoding = "unicode"
+	case "iso-8859-1", "latin1":
+		e.encoding = "iso-8859-1"
+	case "windows-1252", "cp1252":
+		e.encoding = "windows-1252"
+	default:
+		e.encoding = "utf-8"
+	}
+}
+
+// getEncoder returns the appropriate encoder for the current encoding
+func (e *Editor) getEncoder() encoding.Encoding {
+	switch e.encoding {
+	case "ascii":
+		return charmap.ISO8859_1 // ASCII is subset of ISO8859-1
+	case "unicode", "utf-16", "utf16":
+		return unicode.UTF16(unicode.BigEndian, unicode.UseBOM)
+	case "iso-8859-1", "latin1":
+		return charmap.ISO8859_1
+	case "windows-1252", "cp1252":
+		return charmap.Windows1252
+	default:
+		return nil // UTF-8 is Go's default, no conversion needed
+	}
+}
+
+// saveWithEncoding saves the content using the specified encoding
+func (e *Editor) saveWithEncoding(filename, content string) error {
+	encoder := e.getEncoder()
+
+	var data []byte
+	var err error
+
+	if encoder != nil {
+		// Convert from UTF-8 to target encoding
+		data, err = encoder.NewEncoder().Bytes([]byte(content))
+		if err != nil {
+			return err
+		}
+	} else {
+		// UTF-8, no conversion needed
+		data = []byte(content)
+	}
+
+	return ioutil.WriteFile(filename, data, 0644)
+}
 
 func main() {
 	editor := NewEditor()
