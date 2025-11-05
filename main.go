@@ -520,7 +520,7 @@ func (e *Editor) endsWithBlockKeyword(line string) bool {
 // endsWithSquidPlusPlusBlockKeyword checks for SQU1D++-specific block keywords
 func (e *Editor) endsWithSquidPlusPlusBlockKeyword(line string) bool {
 	squidKeywords := []string{
-		"if", "el", "while", "for", "def", "{",
+		"if", "el", "while", "elif", "for", "def", "{",
 	}
 
 	for _, keyword := range squidKeywords {
@@ -794,7 +794,7 @@ func (e *Editor) executeCommand() {
 			}
 			e.adjustScroll()
 		}
-	case "setenc", "encode":
+	case "encode":
 		if len(args) >= 2 {
 			e.setEncoding(strings.ToLower(args[1]))
 		}
@@ -894,12 +894,12 @@ func (e *Editor) Render() {
 	drawLine(e.screen, 0, 0, w, '-')
 	header := "SITE v1.1, written by SQU1DMAN"
 	if e.filename != "" {
-		header += " | " + e.filename
+		header += " | " + e.filename + " (" + e.encoding + ")"
 		if e.dirty {
 			header += " (Modified)"
 		}
+		header += " | Format: " + fileFormat
 	}
-	header += " | Format: " + string(fileFormat) + " (" + e.encoding + ")"
 	drawString(e.screen, 0, 1, header)
 	drawLine(e.screen, 0, 2, w, '-')
 
@@ -1668,7 +1668,7 @@ func (h *SyntaxHighlighter) setupSquidPlusPlusHighlighting() {
 		"var", "suppress", "def", "if", "el", "elif", "while", "for", "return", "true", "false", "null",
 		"break", "continue", "include", "pkg_create", "pkg_list", "pkg_remove", "i2fl", "fl2i",
 		"write", "read", "cat", "append", "tp", "abs", "sqrt", "pow", "sin", "cos", "upper",
-		"lower", "trim", "env", "exec", "sleep", "now",
+		"lower", "trim", "env", "exec", "sleep", "now", "exit",
 	}
 
 	for _, keyword := range keywords {
@@ -2159,39 +2159,52 @@ func (e *Editor) loadMoreLines(n int) {
 }
 
 func (e *Editor) getTokenStyle(tokenType TokenType) tcell.Style {
-	// VS Code-like color scheme with dark teal background
+	// Refined VS Code-inspired theme: deep navy background, high contrast, clean accents
 	baseStyle := tcell.StyleDefault.Background(tcell.NewRGBColor(15, 20, 30))
 
 	switch tokenType {
-	case TokenKeyword:
-		// Keywords - rgb(0, 106, 255) - bright blue
-		return baseStyle.Foreground(tcell.NewRGBColor(0, 106, 255)).Bold(true)
-	case TokenString, TokenValue, TokenRegex:
-		// Strings - rgb(16, 128, 16) - green
-		return baseStyle.Foreground(tcell.NewRGBColor(16, 128, 16))
-	case TokenComment, TokenDoctype, TokenPreprocessor:
-		// Comments - rgb(128, 128, 128) - gray
-		return baseStyle.Foreground(tcell.NewRGBColor(128, 128, 128)).Italic(true)
-	case TokenFunction, TokenMethod:
-		// Functions/Methods - rgb(255, 0, 255) - magenta
-		return baseStyle.Foreground(tcell.NewRGBColor(255, 0, 255))
-	case TokenVariable, TokenDelimiter:
-		// Variables/Parameters - rgb(128, 128, 16) - olive/yellow-green
-		return baseStyle.Foreground(tcell.NewRGBColor(128, 128, 16))
-	case TokenNumber, TokenConstant, TokenUnit, TokenEscape:
-		// Numbers/Constants/Operators - rgb(255, 165, 0) - orange
-		return baseStyle.Foreground(tcell.NewRGBColor(255, 165, 0))
-	case TokenOperator, TokenImportant, TokenMacro, TokenTag:
-		// Operators/Punctuation - rgb(255, 165, 0) - orange
-		return baseStyle.Foreground(tcell.NewRGBColor(255, 165, 0))
-	case TokenType_, TokenClass, TokenAttribute, TokenProperty, TokenPseudo, TokenAnnotation, TokenNamespace:
-		// Other misc syntax elements - rgb(0, 255, 255) - cyan
-		return baseStyle.Foreground(tcell.NewRGBColor(0, 255, 255))
-	default:
-		// Everything else - default style
-		return baseStyle
+		case TokenKeyword:
+			// Keywords - Bright Azure Blue (pops well on dark)
+			return baseStyle.Foreground(tcell.NewRGBColor(45, 150, 255)).Bold(true)
+
+		case TokenString, TokenValue, TokenRegex:
+			// Strings - Fresh Emerald Green
+			return baseStyle.Foreground(tcell.NewRGBColor(50, 205, 120))
+
+		case TokenComment, TokenDoctype, TokenPreprocessor:
+			// Comments - Muted Slate Grey (readable but subtle)
+			return baseStyle.Foreground(tcell.NewRGBColor(105, 115, 130)).Italic(true)
+
+		case TokenFunction, TokenMethod:
+			// Functions/Methods - Vibrant Orchid
+			return baseStyle.Foreground(tcell.NewRGBColor(200, 120, 255)).Bold(true)
+
+		case TokenVariable:
+			// Variables - Golden Yellow for visibility
+			return baseStyle.Foreground(tcell.NewRGBColor(240, 200, 80))
+
+		case TokenDelimiter:
+			// Delimiters - Neutral Silver (for clarity, non-distracting)
+			return baseStyle.Foreground(tcell.NewRGBColor(180, 180, 190))
+
+		case TokenNumber, TokenConstant, TokenUnit, TokenEscape:
+			// Numbers/Constants - Lively Tangerine Orange
+			return baseStyle.Foreground(tcell.NewRGBColor(255, 170, 60))
+
+		case TokenOperator, TokenImportant, TokenMacro, TokenTag:
+			// Operators/Punctuation - Fiery Red for high contrast
+			return baseStyle.Foreground(tcell.NewRGBColor(255, 85, 85)).Bold(true)
+
+		case TokenType_, TokenClass, TokenAttribute, TokenProperty, TokenPseudo, TokenAnnotation, TokenNamespace:
+			// Types, Classes, Properties - Crisp Cyan
+			return baseStyle.Foreground(tcell.NewRGBColor(0, 255, 255)).Bold(true)
+
+		default:
+			// Everything else - soft off-white default
+			return baseStyle.Foreground(tcell.NewRGBColor(220, 220, 230))
 	}
 }
+
 
 // ----------------- AUTO-CLOSING BRACKETS/QUOTES -----------------
 
